@@ -8,6 +8,7 @@
 #include <GarrysMod/Lua/LuaInterface.h>
 #include <GarrysMod/Lua/LuaShared.h>
 
+#include <algorithm>
 #include <atomic>
 #include <string>
 
@@ -21,6 +22,28 @@ using GarrysMod::Lua::ILuaBase;
 using GarrysMod::Lua::ILuaInterface;
 using GarrysMod::Lua::ILuaShared;
 using Factory = void* (__cdecl*)(const char*, int*);
+using RunStringFn = bool (__thiscall*)(ILuaInterface*, const char*, const char*,
+                                      const char*, bool, bool);
+using RunStringExFn = bool (__thiscall*)(ILuaInterface*, const char*, const char*,
+                                        const char*, bool, bool, bool, bool);
+using FindAndRunScriptFn = bool (__thiscall*)(ILuaInterface*, const char*, bool,
+                                             bool, const char*, bool);
+
+// garrysmod_common MSVC vtable layout: ILuaBase has 55 virtual functions.
+// Check these indices against the selected header revision before upgrades.
+constexpr size_t kRunStringSlot = 92;
+constexpr size_t kRunStringExSlot = 111;
+constexpr size_t kFindAndRunScriptSlot = 97;
+
+// Prevent attacker-controlled strings/floods from forcing large allocations,
+// excessive MENU transitions, or unbounded stdout work on the game thread.
+constexpr unsigned int kMaxIdentifierBytes = 4096;
+constexpr unsigned int kMaxSourceBytes = 1024 * 1024;
+constexpr unsigned int kMaxCallsPerSecond = 256;
+#ifdef MENUSTATE_COMPILESTRING_STDOUT
+constexpr unsigned int kPreviewBytes = 160;
+#endif
+
 
 constexpr char kBridgeName[] = "__msc_bridge_40ad3b1e";
 constexpr char kMarkerName[] = "__msc_wrapper_40ad3b1e";
@@ -34,13 +57,14 @@ do
     local bridge = rawget(_G, "__msc_bridge_40ad3b1e")
     if type(original) ~= "function" or type(bridge) ~= "function" then return end
 
+    local blockedFunction = function() end -- Reuse this for large batches.
     local wrapper = function(code, ...)
         if type(code) == "string" then
             local identifier, handleError = ...
             if type(identifier) == "string" then
                 local verdict = bridge(code, identifier, handleError)
                 if verdict == false then
-                    return function() end -- Suppress execution, still return a function.
+                    return blockedFunction -- No per-call closure allocation.
                 elseif type(verdict) == "string" then
                     code = verdict
                 end
@@ -62,7 +86,15 @@ std::atomic<DWORD> g_gameThreadId{0};
 std::atomic<ILuaShared*> g_shared{nullptr};
 std::atomic<HHOOK> g_windowHook{nullptr};
 std::atomic<unsigned> g_errorLogs{0};
+std::atomic<bool> g_earlyDetoursInstalled{false};
+RunStringFn g_originalRunString = nullptr;
+RunStringExFn g_originalRunStringEx = nullptr;
+FindAndRunScriptFn g_originalFindAndRunScript = nullptr;
 thread_local bool g_inMenuHook = false;
+thread_local bool g_installing = false;
+thread_local ULONGLONG g_rateWindowStart = 0;
+thread_local unsigned int g_rateWindowCalls = 0;
+thread_local unsigned int g_suppressed = 0;
 
 void Log(const char* message) noexcept {
     OutputDebugStringA(message);
@@ -85,6 +117,16 @@ public:
 private:
     ILuaBase* lua_;
     int top_;
+};
+
+class ScopedInstalling final {
+public:
+    ScopedInstalling() : prior_(g_installing) { g_installing = true; }
+    ~ScopedInstalling() { g_installing = prior_; }
+    ScopedInstalling(const ScopedInstalling&) = delete;
+    ScopedInstalling& operator=(const ScopedInstalling&) = delete;
+private:
+    bool prior_;
 };
 
 class ScopedCallback final {
@@ -110,8 +152,44 @@ int ClientDecision(lua_State* state) {
         const char* identifier = client->GetString(2, &idLen);
         if (!code || !identifier) return 0;
 
-        // Copy the source before entering another Lua realm. Never retain Lua
-        // pointers across potential garbage collection in MENU callbacks.
+        // Never copy a huge Lua string into C++ or pass it to MENU. The large
+        // identifier in the reported init.lua snippet is ~100 million bytes.
+        if (idLen > kMaxIdentifierBytes || codeLen > kMaxSourceBytes) {
+#ifdef MENUSTATE_COMPILESTRING_STDOUT
+            const std::string idPreview(identifier, std::min(idLen, kPreviewBytes));
+            const std::string codePreview(code, std::min(codeLen, kPreviewBytes));
+            StdoutConsole::Publish(idPreview, codePreview,
+                idLen > kMaxIdentifierBytes ? "BLOCKED (oversized identifier; preview only)"
+                                            : "BLOCKED (oversized source; preview only)", nullptr);
+#endif
+            client->PushBool(false);
+            return 1;
+        }
+
+        // Protect the UI thread against Lua compilation floods. Even 250,000
+        // tiny MENU callbacks can exceed the ~10s budget in the supplied case.
+        const ULONGLONG now = GetTickCount64();
+        if (!g_rateWindowStart || now - g_rateWindowStart >= 1000) {
+            g_rateWindowStart = now;
+            g_rateWindowCalls = 0;
+            g_suppressed = 0;
+        }
+        if (++g_rateWindowCalls > kMaxCallsPerSecond) {
+            ++g_suppressed;
+#ifdef MENUSTATE_COMPILESTRING_STDOUT
+            // Log sparsely; do not enqueue a quarter-million log messages.
+            if (g_suppressed == 1 || (g_suppressed % 16384) == 0) {
+                const std::string idPreview(identifier, std::min(idLen, kPreviewBytes));
+                const std::string codePreview(code, std::min(codeLen, kPreviewBytes));
+                StdoutConsole::Publish(idPreview, codePreview,
+                    "BLOCKED (CompileString rate limit; preview only)", nullptr);
+            }
+#endif
+            client->PushBool(false);
+            return 1;
+        }
+
+        // Copy data before entering another Lua realm; MENU callbacks may GC.
         const std::string source(code, codeLen);
         const std::string chunk(identifier, idLen);
         const bool handleError = client->Top() < 3 ||
@@ -135,8 +213,16 @@ int ClientDecision(lua_State* state) {
         }
 
         ILuaShared* shared = g_shared.load(std::memory_order_acquire);
-        if (!shared || shared->GetLuaInterface(GarrysMod::Lua::State::CLIENT) != client) {
-            report("BYPASS (CLIENT state unavailable)");
+        if (!shared) {
+            report("BYPASS (lua_shared unavailable)");
+            return 0;
+        }
+        // At the earliest CLIENT bootstrap GetLuaInterface(CLIENT) may not be
+        // exposed yet. The VM's native realm check still identifies CLIENT.
+        ILuaInterface* knownClient = shared->GetLuaInterface(GarrysMod::Lua::State::CLIENT);
+        if (knownClient ? static_cast<ILuaBase*>(knownClient) != client
+                        : !static_cast<ILuaInterface*>(client)->IsClient()) {
+            report("BYPASS (unexpected Lua realm)");
             return 0;
         }
         ILuaInterface* menu = shared->GetLuaInterface(GarrysMod::Lua::State::MENU);
@@ -177,6 +263,11 @@ int ClientDecision(lua_State* state) {
             unsigned int replacementLen = 0;
             const char* replacement = lua->GetString(-1, &replacementLen);
             if (replacement) {
+                if (replacementLen > kMaxSourceBytes) {
+                    report("BLOCKED (oversized MENU replacement)");
+                    client->PushBool(false);
+                    return 1;
+                }
                 const std::string rewritten(replacement, replacementLen);
                 report("REPLACED", &rewritten);
                 client->PushString(rewritten.data(), replacementLen);
@@ -206,6 +297,7 @@ ClientState CheckClient(ILuaBase* lua) {
 }
 
 bool InstallClient(ILuaInterface* client) {
+    ScopedInstalling installGuard; // Bootstrap itself may enter RunStringEx.
     ILuaBase* lua = static_cast<ILuaBase*>(client);
     {
         ScopedLuaStack stack(lua);
@@ -243,10 +335,127 @@ ILuaShared* FindShared() {
     return shared;
 }
 
+// Early interception is essential: lua/includes/init.lua is the first CLIENT
+// script. Polling for an already running CLIENT state is too late, especially
+// for scripts that cache local CS = CompileString before our wrapper exists.
+// Install detours on the existing MENU interface vtable while still in menu.
+// They do not replace script content; before the first CLIENT script entry they
+// install the same lightweight global CompileString wrapper as before.
+#if defined(_M_IX86)
+#define MSC_DETOUR_CALL __fastcall
+#define MSC_DETOUR_THIS ILuaInterface* self, void*,
+#else
+#define MSC_DETOUR_CALL
+#define MSC_DETOUR_THIS ILuaInterface* self,
+#endif
+
+void BeforeClientScript(ILuaInterface* self) {
+    if (g_status.load(std::memory_order_acquire) == -1 ||
+        g_installing || !self || !g_earlyDetoursInstalled.load(std::memory_order_acquire))
+        return;
+    if (GetCurrentThreadId() != g_gameThreadId.load(std::memory_order_acquire))
+        return;
+    ILuaShared* shared = g_shared.load(std::memory_order_acquire);
+    if (!shared) return;
+    // IsClient also works during creation when GetLuaInterface(CLIENT) might
+    // not yet have been published by ILuaShared.
+    if (!self->IsClient()) return;
+    if (shared->GetLuaInterface(GarrysMod::Lua::State::MENU) == self) return;
+    try {
+        auto* lua = static_cast<ILuaBase*>(self);
+        const ClientState state = CheckClient(lua);
+        if (state == ClientState::Waiting && InstallClient(self)) {
+            g_status.store(1, std::memory_order_release);
+            Log("[msc] installed before CLIENT script execution\n");
+        }
+    } catch (...) {
+        Log("[msc] early CLIENT wrapper installation failed\n");
+    }
+}
+
+void GuardedBeforeClientScript(ILuaInterface* self) {
+    __try {
+        BeforeClientScript(self);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_status.store(-1, std::memory_order_release);
+        Log("[msc] exception at early script-entry probe; disabling instrumentation\n");
+    }
+}
+
+bool MSC_DETOUR_CALL OnRunString(MSC_DETOUR_THIS const char* filename,
+        const char* path, const char* source, bool run, bool errors) {
+    if (!g_originalRunString) return false;
+    GuardedBeforeClientScript(self);
+    return g_originalRunString(self, filename, path, source, run, errors);
+}
+
+bool MSC_DETOUR_CALL OnRunStringEx(MSC_DETOUR_THIS const char* filename,
+        const char* path, const char* source, bool run, bool errors,
+        bool dontPushErrors, bool noReturns) {
+    if (!g_originalRunStringEx) return false;
+    GuardedBeforeClientScript(self);
+    return g_originalRunStringEx(self, filename, path, source, run, errors,
+                                  dontPushErrors, noReturns);
+}
+
+bool MSC_DETOUR_CALL OnFindAndRunScript(MSC_DETOUR_THIS const char* filename,
+        bool run, bool errors, const char* source, bool noReturns) {
+    if (!g_originalFindAndRunScript) return false;
+    GuardedBeforeClientScript(self);
+    return g_originalFindAndRunScript(self, filename, run, errors, source, noReturns);
+}
+
+bool PatchSlot(void** slot, void* replacement) {
+    DWORD oldProtection = 0;
+    if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &oldProtection))
+        return false;
+    InterlockedExchangePointer(reinterpret_cast<PVOID volatile*>(slot), replacement);
+    DWORD ignored = 0;
+    VirtualProtect(slot, sizeof(void*), oldProtection, &ignored);
+    return true;
+}
+
+bool InstallEarlyDetours(ILuaInterface* menu) {
+    if (g_earlyDetoursInstalled.load(std::memory_order_acquire)) return true;
+    if (!menu) return false;
+    // MENU must be initialized before we install the early CLIENT trampoline.
+    ILuaBase* lua = static_cast<ILuaBase*>(menu);
+    ScopedLuaStack stack(lua);
+    lua->PushSpecial(GarrysMod::Lua::SPECIAL_GLOB);
+    lua->GetField(-1, "hook");
+    if (lua->GetType(-1) != LuaType::Table) return false;
+    lua->GetField(-1, "Run");
+    if (lua->GetType(-1) != LuaType::Function) return false;
+
+    auto** table = *reinterpret_cast<void***>(menu);
+    if (!table || !table[kRunStringSlot] || !table[kRunStringExSlot] ||
+        !table[kFindAndRunScriptSlot]) return false;
+    g_originalRunString = reinterpret_cast<RunStringFn>(table[kRunStringSlot]);
+    g_originalRunStringEx = reinterpret_cast<RunStringExFn>(table[kRunStringExSlot]);
+    g_originalFindAndRunScript =
+        reinterpret_cast<FindAndRunScriptFn>(table[kFindAndRunScriptSlot]);
+    if (!PatchSlot(&table[kRunStringSlot], reinterpret_cast<void*>(&OnRunString)))
+        return false;
+    if (!PatchSlot(&table[kRunStringExSlot], reinterpret_cast<void*>(&OnRunStringEx))) {
+        PatchSlot(&table[kRunStringSlot], reinterpret_cast<void*>(g_originalRunString));
+        return false;
+    }
+    if (!PatchSlot(&table[kFindAndRunScriptSlot],
+                   reinterpret_cast<void*>(&OnFindAndRunScript))) {
+        PatchSlot(&table[kRunStringExSlot], reinterpret_cast<void*>(g_originalRunStringEx));
+        PatchSlot(&table[kRunStringSlot], reinterpret_cast<void*>(g_originalRunString));
+        return false;
+    }
+    g_earlyDetoursInstalled.store(true, std::memory_order_release);
+    Log("[msc] early script-entry monitoring armed; join a server now\n");
+    return true;
+}
+
 void Tick() {
     ILuaShared* shared = FindShared();
     if (!shared) return;
     ILuaInterface* menu = shared->GetLuaInterface(GarrysMod::Lua::State::MENU);
+    if (menu) InstallEarlyDetours(menu);
     ILuaInterface* client = shared->GetLuaInterface(GarrysMod::Lua::State::CLIENT);
     if (!menu || !client) {
         g_status.store(0, std::memory_order_release);
@@ -265,9 +474,11 @@ void Tick() {
             Log("[msc] CLIENT CompileString changed after installation; not rewrapping\n");
         return;
     }
+    // Fallback for injection into an already running CLIENT. Cannot recover
+    // CompileString calls that occurred during includes/init.lua.
     if (InstallClient(client)) {
         g_status.store(1, std::memory_order_release);
-        Log("[msc] CLIENT CompileString wrapper installed; MENU hook is available\n");
+        Log("[msc] CLIENT wrapper installed late; earlier calls were missed\n");
     }
 }
 
@@ -360,4 +571,9 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
 
 extern "C" __declspec(dllexport) int __cdecl MenuCompileString_Status() {
     return g_status.load(std::memory_order_acquire);
+}
+
+// 1 means early native RunString monitoring is active; join AFTER observing it.
+extern "C" __declspec(dllexport) int __cdecl MenuCompileString_EarlyHookStatus() {
+    return g_earlyDetoursInstalled.load(std::memory_order_acquire) ? 1 : 0;
 }
