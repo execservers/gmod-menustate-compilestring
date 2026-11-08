@@ -11,6 +11,10 @@
 #include <atomic>
 #include <string>
 
+#ifdef MENUSTATE_COMPILESTRING_STDOUT
+#include "stdout_console.h"
+#endif
+
 namespace {
 namespace LuaType = GarrysMod::Lua::Type;
 using GarrysMod::Lua::ILuaBase;
@@ -97,18 +101,8 @@ int ClientDecision(lua_State* state) {
     ILuaBase* client = state->luabase;
     client->SetState(state);
 
-    if (g_inMenuHook ||
-        GetCurrentThreadId() != g_gameThreadId.load(std::memory_order_acquire) ||
-        client->GetType(1) != LuaType::String ||
-        client->GetType(2) != LuaType::String) {
-        return 0; // Fail open if this would cross threads or recurse.
-    }
-
-    ILuaShared* shared = g_shared.load(std::memory_order_acquire);
-    if (!shared || shared->GetLuaInterface(GarrysMod::Lua::State::CLIENT) != client)
-        return 0;
-    ILuaInterface* menu = shared->GetLuaInterface(GarrysMod::Lua::State::MENU);
-    if (!menu) return 0;
+    if (client->GetType(1) != LuaType::String ||
+        client->GetType(2) != LuaType::String) return 0;
 
     try {
         unsigned int codeLen = 0, idLen = 0;
@@ -116,31 +110,66 @@ int ClientDecision(lua_State* state) {
         const char* identifier = client->GetString(2, &idLen);
         if (!code || !identifier) return 0;
 
-        // Copy before invoking another Lua realm: the source state may perform GC
-        // as a consequence of other native MENU callbacks.
+        // Copy the source before entering another Lua realm. Never retain Lua
+        // pointers across potential garbage collection in MENU callbacks.
         const std::string source(code, codeLen);
         const std::string chunk(identifier, idLen);
         const bool handleError = client->Top() < 3 ||
                                  client->GetType(3) == LuaType::Nil ||
                                  client->GetBool(3);
+        // The non-stdout build has no console dependency or logging overhead.
+        const auto report = [&](const char* decision,
+                                const std::string* replacement = nullptr) noexcept {
+#ifdef MENUSTATE_COMPILESTRING_STDOUT
+            StdoutConsole::Publish(chunk, source, decision, replacement);
+#else
+            (void)decision;
+            (void)replacement;
+#endif
+        };
+
+        if (g_inMenuHook ||
+            GetCurrentThreadId() != g_gameThreadId.load(std::memory_order_acquire)) {
+            report("BYPASS (reentrant or wrong thread)");
+            return 0; // Fail open on recursion or unexpected Lua thread.
+        }
+
+        ILuaShared* shared = g_shared.load(std::memory_order_acquire);
+        if (!shared || shared->GetLuaInterface(GarrysMod::Lua::State::CLIENT) != client) {
+            report("BYPASS (CLIENT state unavailable)");
+            return 0;
+        }
+        ILuaInterface* menu = shared->GetLuaInterface(GarrysMod::Lua::State::MENU);
+        if (!menu) {
+            report("BYPASS (MENU state unavailable)");
+            return 0;
+        }
 
         ScopedCallback callbackGuard;
         ILuaBase* lua = static_cast<ILuaBase*>(menu);
         ScopedLuaStack menuStack(lua);
         lua->PushSpecial(GarrysMod::Lua::SPECIAL_GLOB);
         lua->GetField(-1, "hook");
-        if (lua->GetType(-1) != LuaType::Table) return 0;
+        if (lua->GetType(-1) != LuaType::Table) {
+            report("ALLOW (no MENU hook table)");
+            return 0;
+        }
         lua->GetField(-1, "Run");
-        if (lua->GetType(-1) != LuaType::Function) return 0;
+        if (lua->GetType(-1) != LuaType::Function) {
+            report("ALLOW (no MENU hook.Run)");
+            return 0;
+        }
         lua->PushString(kHookName);
-        lua->PushString(source.c_str(), codeLen);
-        lua->PushString(chunk.c_str(), idLen);
+        lua->PushString(source.data(), codeLen);
+        lua->PushString(chunk.data(), idLen);
         lua->PushBool(handleError);
         if (lua->PCall(4, 1, 0) != 0) {
             LogHookFailure();
+            report("ALLOW (MENU hook error)");
             return 0;
         }
         if (lua->GetType(-1) == LuaType::Bool && !lua->GetBool(-1)) {
+            report("BLOCKED");
             client->PushBool(false);
             return 1;
         }
@@ -148,10 +177,13 @@ int ClientDecision(lua_State* state) {
             unsigned int replacementLen = 0;
             const char* replacement = lua->GetString(-1, &replacementLen);
             if (replacement) {
-                client->PushString(replacement, replacementLen);
+                const std::string rewritten(replacement, replacementLen);
+                report("REPLACED", &rewritten);
+                client->PushString(rewritten.data(), replacementLen);
                 return 1;
             }
         }
+        report("ALLOWED");
     } catch (...) {
         LogHookFailure();
     }
@@ -294,6 +326,9 @@ DWORD WINAPI Bootstrap(void*) {
         g_status.store(-1, std::memory_order_release);
         return 1;
     }
+#ifdef MENUSTATE_COMPILESTRING_STDOUT
+    StdoutConsole::Start();
+#endif
     Log("[msc] injected; waiting for game window and Lua realms\n");
     for (;;) {
         if (g_status.load(std::memory_order_acquire) == -1) return 1;
