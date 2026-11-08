@@ -1,19 +1,14 @@
--- Execute in CLIENT state after DLL status == 1 and the MENU hook is registered.
-assert(CLIENT, "client_test.lua must be run in CLIENT Lua state")
-local allow = CompileString("print('[msc] original compiled and executed')", "msc_test_allowed")
-assert(type(allow) == "function")
-allow()
+-- CLIENT-side smoke test. With the observer example, nothing is blocked/rewritten.
+assert(CLIENT, "Run this script in CLIENT")
 
-local blocked = CompileString("error('THIS SHOULD NEVER EXECUTE')", "msc_test_blocked")
-assert(type(blocked) == "function")
-blocked()
+local fn = CompileString("return 42", "msc_test_original")
+assert(type(fn) == "function" and fn() == 42)
 
-local replaced = CompileString("error('THIS SHOULD BE REPLACED')", "msc_test_replaced")
-assert(type(replaced) == "function")
-replaced()
+local alias = CompileString
+local second = alias("return 'alias'", "msc_test_local_alias")
+assert(type(second) == "function" and second() == "alias")
 
--- With handleError=false, original error-return-string behavior is preserved.
 local syntaxError = CompileString("local =", "msc_syntax_error", false)
 assert(type(syntaxError) == "string")
 
-print("[msc] CLIENT tests finished")
+print("[msc] original CompileString behavior preserved")

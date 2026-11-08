@@ -8,9 +8,9 @@
 #include <GarrysMod/Lua/LuaInterface.h>
 #include <GarrysMod/Lua/LuaShared.h>
 
-#include <algorithm>
 #include <atomic>
 #include <string>
+#include <string_view>
 
 #ifdef MENUSTATE_COMPILESTRING_STDOUT
 #include "stdout_console.h"
@@ -35,19 +35,10 @@ constexpr size_t kRunStringSlot = 92;
 constexpr size_t kRunStringExSlot = 111;
 constexpr size_t kFindAndRunScriptSlot = 97;
 
-// Prevent attacker-controlled strings/floods from forcing large allocations,
-// excessive MENU transitions, or unbounded stdout work on the game thread.
-constexpr unsigned int kMaxIdentifierBytes = 4096;
-constexpr unsigned int kMaxSourceBytes = 1024 * 1024;
-constexpr unsigned int kMaxCallsPerSecond = 256;
-#ifdef MENUSTATE_COMPILESTRING_STDOUT
-constexpr unsigned int kPreviewBytes = 160;
-#endif
-
-
 constexpr char kBridgeName[] = "__msc_bridge_40ad3b1e";
 constexpr char kMarkerName[] = "__msc_wrapper_40ad3b1e";
 constexpr char kHookName[] = "compilestring";
+constexpr char kControlName[] = "MenuCompileStringControl";
 
 // Runs within CLIENT, only to delegate the decision to MENU; compilation still
 // goes through the original client Lua function (preserving its error behavior).
@@ -57,7 +48,7 @@ do
     local bridge = rawget(_G, "__msc_bridge_40ad3b1e")
     if type(original) ~= "function" or type(bridge) ~= "function" then return end
 
-    local blockedFunction = function() end -- Reuse this for large batches.
+    local blockedFunction = function() end
     local wrapper = function(code, ...)
         if type(code) == "string" then
             local identifier, handleError = ...
@@ -92,9 +83,6 @@ RunStringExFn g_originalRunStringEx = nullptr;
 FindAndRunScriptFn g_originalFindAndRunScript = nullptr;
 thread_local bool g_inMenuHook = false;
 thread_local bool g_installing = false;
-thread_local ULONGLONG g_rateWindowStart = 0;
-thread_local unsigned int g_rateWindowCalls = 0;
-thread_local unsigned int g_suppressed = 0;
 
 void Log(const char* message) noexcept {
     OutputDebugStringA(message);
@@ -102,7 +90,7 @@ void Log(const char* message) noexcept {
 
 void LogHookFailure() noexcept {
     if (g_errorLogs.fetch_add(1, std::memory_order_relaxed) < 5)
-        Log("[msc] MENU compilestring hook errored; allowing original CompileString\n");
+        Log("[msc] MENU compilestring hook failed; keeping original CompileString\n");
 }
 
 class ScopedLuaStack final {
@@ -137,8 +125,9 @@ public:
     ScopedCallback& operator=(const ScopedCallback&) = delete;
 };
 
-// Called by the Lua wrapper only. Returns nil (allow), false (block), or a
-// replacement string. Strings are transferred by value, not as Lua references.
+// Lua bridge: only a MENU hook may alter a CompileString invocation.
+// No built-in size, frequency or source-content policy is applied.
+// In the _stdout_ build, only the diagnostic *copy* is bounded/truncated.
 int ClientDecision(lua_State* state) {
     ILuaBase* client = state->luabase;
     client->SetState(state);
@@ -146,88 +135,44 @@ int ClientDecision(lua_State* state) {
     if (client->GetType(1) != LuaType::String ||
         client->GetType(2) != LuaType::String) return 0;
 
-    try {
-        unsigned int codeLen = 0, idLen = 0;
-        const char* code = client->GetString(1, &codeLen);
-        const char* identifier = client->GetString(2, &idLen);
-        if (!code || !identifier) return 0;
+    unsigned int codeLength = 0;
+    unsigned int identifierLength = 0;
+    const char* code = client->GetString(1, &codeLength);
+    const char* identifier = client->GetString(2, &identifierLength);
+    if (!code || !identifier) return 0;
 
-        // Never copy a huge Lua string into C++ or pass it to MENU. The large
-        // identifier in the reported init.lua snippet is ~100 million bytes.
-        if (idLen > kMaxIdentifierBytes || codeLen > kMaxSourceBytes) {
 #ifdef MENUSTATE_COMPILESTRING_STDOUT
-            const std::string idPreview(identifier, std::min(idLen, kPreviewBytes));
-            const std::string codePreview(code, std::min(codeLen, kPreviewBytes));
-            StdoutConsole::Publish(idPreview, codePreview,
-                idLen > kMaxIdentifierBytes ? "BLOCKED (oversized identifier; preview only)"
-                                            : "BLOCKED (oversized source; preview only)", nullptr);
-#endif
-            client->PushBool(false);
-            return 1;
-        }
-
-        // Protect the UI thread against Lua compilation floods. Even 250,000
-        // tiny MENU callbacks can exceed the ~10s budget in the supplied case.
-        const ULONGLONG now = GetTickCount64();
-        if (!g_rateWindowStart || now - g_rateWindowStart >= 1000) {
-            g_rateWindowStart = now;
-            g_rateWindowCalls = 0;
-            g_suppressed = 0;
-        }
-        if (++g_rateWindowCalls > kMaxCallsPerSecond) {
-            ++g_suppressed;
-#ifdef MENUSTATE_COMPILESTRING_STDOUT
-            // Log sparsely; do not enqueue a quarter-million log messages.
-            if (g_suppressed == 1 || (g_suppressed % 16384) == 0) {
-                const std::string idPreview(identifier, std::min(idLen, kPreviewBytes));
-                const std::string codePreview(code, std::min(codeLen, kPreviewBytes));
-                StdoutConsole::Publish(idPreview, codePreview,
-                    "BLOCKED (CompileString rate limit; preview only)", nullptr);
-            }
-#endif
-            client->PushBool(false);
-            return 1;
-        }
-
-        // Copy data before entering another Lua realm; MENU callbacks may GC.
-        const std::string source(code, codeLen);
-        const std::string chunk(identifier, idLen);
-        const bool handleError = client->Top() < 3 ||
-                                 client->GetType(3) == LuaType::Nil ||
-                                 client->GetBool(3);
-        // The non-stdout build has no console dependency or logging overhead.
-        const auto report = [&](const char* decision,
-                                const std::string* replacement = nullptr) noexcept {
-#ifdef MENUSTATE_COMPILESTRING_STDOUT
-            StdoutConsole::Publish(chunk, source, decision, replacement);
+    const std::string_view codeView(code, codeLength);
+    const std::string_view identifierView(identifier, identifierLength);
+    const auto report = [&](const char* result,
+                            const std::string_view* replacement = nullptr) noexcept {
+        StdoutConsole::Publish(identifierView, codeView, result, replacement);
+    };
 #else
-            (void)decision;
-            (void)replacement;
+    const auto report = [](const char*, const std::string_view* = nullptr) noexcept {};
 #endif
-        };
 
-        if (g_inMenuHook ||
-            GetCurrentThreadId() != g_gameThreadId.load(std::memory_order_acquire)) {
-            report("BYPASS (reentrant or wrong thread)");
-            return 0; // Fail open on recursion or unexpected Lua thread.
-        }
+    if (g_inMenuHook ||
+        GetCurrentThreadId() != g_gameThreadId.load(std::memory_order_acquire)) {
+        report("UNCHANGED (reentrant or unexpected thread)");
+        return 0;
+    }
 
+    try {
         ILuaShared* shared = g_shared.load(std::memory_order_acquire);
         if (!shared) {
-            report("BYPASS (lua_shared unavailable)");
+            report("UNCHANGED (lua_shared unavailable)");
             return 0;
         }
-        // At the earliest CLIENT bootstrap GetLuaInterface(CLIENT) may not be
-        // exposed yet. The VM's native realm check still identifies CLIENT.
         ILuaInterface* knownClient = shared->GetLuaInterface(GarrysMod::Lua::State::CLIENT);
         if (knownClient ? static_cast<ILuaBase*>(knownClient) != client
                         : !static_cast<ILuaInterface*>(client)->IsClient()) {
-            report("BYPASS (unexpected Lua realm)");
+            report("UNCHANGED (unexpected Lua realm)");
             return 0;
         }
         ILuaInterface* menu = shared->GetLuaInterface(GarrysMod::Lua::State::MENU);
         if (!menu) {
-            report("BYPASS (MENU state unavailable)");
+            report("UNCHANGED (MENU unavailable)");
             return 0;
         }
 
@@ -235,50 +180,106 @@ int ClientDecision(lua_State* state) {
         ILuaBase* lua = static_cast<ILuaBase*>(menu);
         ScopedLuaStack menuStack(lua);
         lua->PushSpecial(GarrysMod::Lua::SPECIAL_GLOB);
+
+        // An explicit MENU API option can suspend callbacks. stdout diagnostics
+        // remain independent of this option and never change compilation.
+        lua->GetField(-1, kControlName);
+        if (lua->GetType(-1) == LuaType::Table) {
+            lua->GetField(-1, "enabled");
+            const bool disabled = lua->GetType(-1) == LuaType::Bool && !lua->GetBool(-1);
+            lua->Pop();
+            if (disabled) {
+                report("UNCHANGED (disabled by MENU)");
+                return 0;
+            }
+        }
+        lua->Pop(); // MenuCompileStringControl or nil
+
         lua->GetField(-1, "hook");
         if (lua->GetType(-1) != LuaType::Table) {
-            report("ALLOW (no MENU hook table)");
+            report("UNCHANGED (no MENU hook library)");
             return 0;
         }
         lua->GetField(-1, "Run");
         if (lua->GetType(-1) != LuaType::Function) {
-            report("ALLOW (no MENU hook.Run)");
+            report("UNCHANGED (no MENU hook.Run)");
             return 0;
         }
+
+        // Strings are copied before calling into a different Lua realm. This
+        // allocation is the cost of handing the *complete* data to MENU.
+        const std::string source(code, codeLength);
+        const std::string chunk(identifier, identifierLength);
+        const bool handleError = client->Top() < 3 ||
+                                 client->GetType(3) == LuaType::Nil ||
+                                 client->GetBool(3);
+
         lua->PushString(kHookName);
-        lua->PushString(source.data(), codeLen);
-        lua->PushString(chunk.data(), idLen);
+        lua->PushString(source.data(), codeLength);
+        lua->PushString(chunk.data(), identifierLength);
         lua->PushBool(handleError);
         if (lua->PCall(4, 1, 0) != 0) {
             LogHookFailure();
-            report("ALLOW (MENU hook error)");
+            report("UNCHANGED (MENU hook error)");
             return 0;
         }
         if (lua->GetType(-1) == LuaType::Bool && !lua->GetBool(-1)) {
-            report("BLOCKED");
+            report("BLOCKED (MENU returned false)");
             client->PushBool(false);
             return 1;
         }
         if (lua->GetType(-1) == LuaType::String) {
-            unsigned int replacementLen = 0;
-            const char* replacement = lua->GetString(-1, &replacementLen);
+            unsigned int replacementLength = 0;
+            const char* replacement = lua->GetString(-1, &replacementLength);
             if (replacement) {
-                if (replacementLen > kMaxSourceBytes) {
-                    report("BLOCKED (oversized MENU replacement)");
-                    client->PushBool(false);
-                    return 1;
-                }
-                const std::string rewritten(replacement, replacementLen);
-                report("REPLACED", &rewritten);
-                client->PushString(rewritten.data(), replacementLen);
+                const std::string_view rewritten(replacement, replacementLength);
+                report("REPLACED (MENU returned string)", &rewritten);
+                client->PushString(rewritten.data(), replacementLength);
                 return 1;
             }
         }
-        report("ALLOWED");
+        report("UNCHANGED");
     } catch (...) {
         LogHookFailure();
+        report("UNCHANGED (bridge exception)");
     }
     return 0;
+}
+
+// MENU global is created as soon as MENU becomes available to the injector.
+// It is a plain Lua table; users own the callback decisions via hook.Add.
+// Only 'enabled' is user-writable. Other fields are diagnostic snapshots.
+void UpdateMenuControl(ILuaInterface* menu) {
+    ILuaBase* lua = static_cast<ILuaBase*>(menu);
+    ScopedLuaStack stack(lua);
+    lua->PushSpecial(GarrysMod::Lua::SPECIAL_GLOB);
+    lua->GetField(-1, kControlName);
+    if (lua->GetType(-1) != LuaType::Table) {
+        lua->Pop();
+        lua->CreateTable();
+        lua->PushBool(true);
+        lua->SetField(-2, "enabled");
+        lua->Push(-1);
+        lua->SetField(-3, kControlName);
+    }
+
+    lua->PushBool(g_earlyDetoursInstalled.load(std::memory_order_acquire));
+    lua->SetField(-2, "earlyHookInstalled");
+    const int status = g_status.load(std::memory_order_acquire);
+    lua->PushBool(status == 1);
+    lua->SetField(-2, "clientHookInstalled");
+    const char* statusName = "waiting";
+    if (status == 1) statusName = "installed";
+    else if (status == 2) statusName = "replaced";
+    else if (status == -1) statusName = "disabled";
+    lua->PushString(statusName);
+    lua->SetField(-2, "status");
+#ifdef MENUSTATE_COMPILESTRING_STDOUT
+    lua->PushBool(true);
+#else
+    lua->PushBool(false);
+#endif
+    lua->SetField(-2, "stdout");
 }
 
 // The marker lives in the CLIENT global table and disappears when that realm is
@@ -455,23 +456,26 @@ void Tick() {
     ILuaShared* shared = FindShared();
     if (!shared) return;
     ILuaInterface* menu = shared->GetLuaInterface(GarrysMod::Lua::State::MENU);
-    if (menu) InstallEarlyDetours(menu);
+    if (!menu) return;
+    InstallEarlyDetours(menu);
     ILuaInterface* client = shared->GetLuaInterface(GarrysMod::Lua::State::CLIENT);
-    if (!menu || !client) {
+    if (!client) {
         g_status.store(0, std::memory_order_release);
+        UpdateMenuControl(menu);
         return;
     }
     auto* lua = static_cast<ILuaBase*>(client);
     const ClientState state = CheckClient(lua);
     if (state == ClientState::Installed) {
         g_status.store(1, std::memory_order_release);
+        UpdateMenuControl(menu);
         return;
     }
     if (state == ClientState::Replaced) {
-        // Another addon may have deliberately wrapped our function. Rewrapping
-        // it would cause duplicate policies, so do not change it again.
+        // Another addon may have wrapped the function. Do not overwrite it.
         if (g_status.exchange(2, std::memory_order_acq_rel) != 2)
             Log("[msc] CLIENT CompileString changed after installation; not rewrapping\n");
+        UpdateMenuControl(menu);
         return;
     }
     // Fallback for injection into an already running CLIENT. Cannot recover
@@ -480,6 +484,7 @@ void Tick() {
         g_status.store(1, std::memory_order_release);
         Log("[msc] CLIENT wrapper installed late; earlier calls were missed\n");
     }
+    UpdateMenuControl(menu);
 }
 
 int WINAPI ProbeFilter(unsigned int) {
@@ -569,11 +574,3 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
     return TRUE;
 }
 
-extern "C" __declspec(dllexport) int __cdecl MenuCompileString_Status() {
-    return g_status.load(std::memory_order_acquire);
-}
-
-// 1 means early native RunString monitoring is active; join AFTER observing it.
-extern "C" __declspec(dllexport) int __cdecl MenuCompileString_EarlyHookStatus() {
-    return g_earlyDetoursInstalled.load(std::memory_order_acquire) ? 1 : 0;
-}

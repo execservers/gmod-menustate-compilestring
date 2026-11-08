@@ -12,6 +12,7 @@
 #include <deque>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 
@@ -22,6 +23,9 @@ struct Entry {
     std::string result;
     std::string replacement;
     bool replaced = false;
+    size_t identifierLength = 0;
+    size_t sourceLength = 0;
+    size_t replacementLength = 0;
 
     size_t Size() const noexcept {
         return identifier.size() + source.size() + replacement.size();
@@ -32,6 +36,10 @@ struct Entry {
 constexpr size_t kMaxQueuedBytes = 16 * 1024 * 1024;
 constexpr size_t kMaxQueuedEntries = 256;
 constexpr DWORD kWriteChunk = 16 * 1024;
+// Limits affect console output ONLY, never CLIENT compilation or MENU decisions.
+constexpr size_t kMaxLogIdentifier = 1024;
+constexpr size_t kMaxLogSource = 64 * 1024;
+constexpr size_t kMaxLogReplacement = 64 * 1024;
 
 struct Queue {
     std::mutex mutex;
@@ -63,17 +71,26 @@ void WriteText(HANDLE output, const char* text) noexcept {
     WriteBytes(output, text, std::char_traits<char>::length(text));
 }
 
+void WritePreview(HANDLE output, const std::string& text, size_t originalLength) noexcept {
+    WriteBytes(output, text.data(), text.size());
+    if (text.size() < originalLength) {
+        const std::string suffix = "\r\n[truncated; " + std::to_string(originalLength) +
+                                   " original bytes]";
+        WriteBytes(output, suffix.data(), suffix.size());
+    }
+}
+
 void Print(HANDLE output, const Entry& entry) noexcept {
     WriteText(output, "\r\n========== CompileString ==========\r\nIDENTIFIER: ");
-    WriteBytes(output, entry.identifier.data(), entry.identifier.size());
+    WritePreview(output, entry.identifier, entry.identifierLength);
     WriteText(output, "\r\nRESULT: ");
     WriteBytes(output, entry.result.data(), entry.result.size());
     WriteText(output, "\r\nSOURCE:\r\n");
-    WriteBytes(output, entry.source.data(), entry.source.size());
+    WritePreview(output, entry.source, entry.sourceLength);
     WriteText(output, "\r\n");
     if (entry.replaced) {
         WriteText(output, "REPLACEMENT:\r\n");
-        WriteBytes(output, entry.replacement.data(), entry.replacement.size());
+        WritePreview(output, entry.replacement, entry.replacementLength);
         WriteText(output, "\r\n");
     }
     WriteText(output, "===================================\r\n");
@@ -135,33 +152,34 @@ void StdoutConsole::Start() noexcept {
     }
 }
 
-void StdoutConsole::Publish(const std::string& identifier, const std::string& source,
-                            const char* result, const std::string* replacement) noexcept {
+void StdoutConsole::Publish(std::string_view identifier, std::string_view source,
+                            const char* result, const std::string_view* replacement) noexcept {
     if (!g_active.load(std::memory_order_acquire)) return;
-
-    const size_t extra = replacement ? replacement->size() : 0;
-    // Prevent overflow and reject a single oversized entry before copying.
-    if (identifier.size() > kMaxQueuedBytes ||
-        source.size() > kMaxQueuedBytes - identifier.size() ||
-        extra > kMaxQueuedBytes - identifier.size() - source.size()) {
-        g_dropped.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-
     try {
+        Queue& queue = SharedQueue();
+        // Do not wait for the console thread or copy large CLIENT strings while
+        // the queue is busy. Dropped logs never affect compilation.
+        std::unique_lock<std::mutex> lock(queue.mutex, std::try_to_lock);
+        if (!lock.owns_lock() || queue.entries.size() >= kMaxQueuedEntries) {
+            g_dropped.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
         Entry entry;
-        entry.identifier = identifier;
-        entry.source = source;
+        entry.identifierLength = identifier.size();
+        entry.sourceLength = source.size();
+        entry.identifier.assign(identifier.data(), std::min(identifier.size(), kMaxLogIdentifier));
+        entry.source.assign(source.data(), std::min(source.size(), kMaxLogSource));
         entry.result = result;
         entry.replaced = replacement != nullptr;
-        if (replacement) entry.replacement = *replacement;
+        if (replacement) {
+            entry.replacementLength = replacement->size();
+            entry.replacement.assign(replacement->data(),
+                                     std::min(replacement->size(), kMaxLogReplacement));
+        }
 
         const size_t bytes = entry.Size();
-        Queue& queue = SharedQueue();
-        // Never wait for console output or the writer's mutex on a game thread.
-        std::unique_lock<std::mutex> lock(queue.mutex, std::try_to_lock);
-        if (!lock.owns_lock() || queue.entries.size() >= kMaxQueuedEntries ||
-            bytes > kMaxQueuedBytes - queue.bytes) {
+        if (bytes > kMaxQueuedBytes - queue.bytes) {
             g_dropped.fetch_add(1, std::memory_order_relaxed);
             return;
         }
