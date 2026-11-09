@@ -164,6 +164,6 @@ jobs:
             gh release create "$tag" dist/*.dll dist/*.exe \
               --target "$GITHUB_SHA" \
               --title "$tag" \
-              --notes "Automated x86/x64 DLLs (normal/stdout) and Go injectors for $GITHUB_SHA" \
+              --notes "Automated x86/x64 DLLs (normal/stdout) and injectors for $GITHUB_SHA" \
               --latest="$latest"
           fi

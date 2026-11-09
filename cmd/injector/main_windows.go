@@ -23,7 +23,7 @@ func run() error {
 	var updater *githubUpdater
 	var latest *releaseInfo
 	if repository != "" && tlsSPKIPins != "" {
-		fmt.Println("[Update] Checking GitHub Releases over pinned HTTPS...")
+		fmt.Println("[Update] Checking GitHub Releases...")
 		u, err := newGithubUpdater(repository, tlsSPKIPins)
 		if err != nil {
 			fmt.Printf("[Update] Disabled: %v\n", err)
