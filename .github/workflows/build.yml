@@ -55,12 +55,17 @@ jobs:
       value: ${{ steps.collect.outputs.value }}
     steps:
       - uses: actions/checkout@v4
-      - name: Collect CA-verified GitHub SPKI pins
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: cmd/injector/go.mod
+      - name: Collect CA-verified GitHub SPKI pins (all required hosts)
         id: collect
         shell: bash
         run: |
-          pins="$(bash scripts/collect-github-pins.sh)"
-          echo "value=$pins" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          pins="$(go run scripts/collect-github-pins.go)"
+          test -n "$pins"
+          printf "value=%s\n" "$pins" >> "$GITHUB_OUTPUT"
 
   injector:
     needs: [dll, tls-pins]
@@ -94,7 +99,7 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: '0'
           REPOSITORY: execservers/gmod-menustate-compilestring
-          TLS_PINS: ${{ vars.TLS_SPKI_PINS || needs.tls-pins.outputs.value }}
+          TLS_PINS: ${{ needs.tls-pins.outputs.value }}
           OUTPUT_NAME: ${{ matrix.output }}
         run: |
           Move-Item "payload/${{ matrix.dll }}" "payload/menustate_compilestring.dll"

@@ -1,0 +1,3 @@
+GitHub Actions copies the non-stdout DLL here before building the Go injector.
+Do not check any prebuilt DLL into source control.
+For a local offline build, put the correct-architecture DLL here as menustate_compilestring.dll.
