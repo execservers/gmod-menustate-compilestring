@@ -2,3 +2,6 @@
 /.vs/
 /out/
 *.user
+cmd/injector/payload/menustate_compilestring.dll
+cmd/injector/*.exe
+cmd/injector/*.test

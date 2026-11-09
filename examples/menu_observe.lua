@@ -4,6 +4,7 @@ assert(type(MenuCompileStringControl) == "table", "DLL's MENU API is not ready")
 
 MenuCompileStringControl.enabled = true
 
-hook.Add("compilestring", "observer", function(code, identifier, handleError)
+hook.Add("compilestring", "msc_observer", function(code, identifier, handleError)
     MsgN("[msc] ", identifier, " (", #code, " bytes, handleError=", tostring(handleError), ")")
+    -- Returning nil leaves the original compilation fully unchanged.
 end)
